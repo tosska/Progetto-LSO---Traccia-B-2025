@@ -89,5 +89,4 @@ Una volta avviato il client, digita:
 ---
 
 ## 👥 Componenti del Gruppo
-* **Nome Cognome** - Matricola: 0123456789
-* **Nome Cognome** - Matricola: 0123456789
+* **Lorenzo Trignano** - Matricola: N86004496
