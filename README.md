@@ -1,9 +1,5 @@
 # 🏰 Conquista del Territorio - Progetto LSO 2025
 
-![C](https://img.shields.io/badge/Language-C-blue.svg)
-![OS](https://img.shields.io/badge/OS-UNIX%2FLinux-orange.svg)
-![Docker](https://img.shields.io/badge/Docker-Supported-blue.svg)
-
 Progetto per l'esame di **Laboratorio di Sistemi Operativi** (A.A. 2024-2025), sviluppato in linguaggio C su piattaforma UNIX.
 
 ## 📖 Descrizione del Progetto (Traccia B)
