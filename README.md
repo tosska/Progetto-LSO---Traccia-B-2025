@@ -1,6 +1,6 @@
 # 🏰 Conquista del Territorio - Progetto LSO 2025
 
-Progetto per l'esame di **Laboratorio di Sistemi Operativi** (A.A. 2024-2025), sviluppato in linguaggio C su piattaforma UNIX.
+Progetto per l'esame di **Laboratorio di Sistemi Operativi** (A.A. 2025-2026), sviluppato in linguaggio C su piattaforma UNIX/Linux.
 
 ## 📖 Descrizione del Progetto (Traccia B)
 Il progetto implementa un sistema Client-Server basato su socket TCP per un gioco multiplayer di conquista del territorio. I giocatori si muovono su una griglia, conquistando le celle libere al loro passaggio. Gli ostacoli (muri) sono nascosti dalla *Fog of War* e vengono rivelati individualmente solo quando un giocatore vi si scontra. La partita ha una durata prefissata (timeout globale), al termine della quale vince chi possiede più celle.
@@ -12,79 +12,69 @@ Il progetto implementa un sistema Client-Server basato su socket TCP per un gioc
 L'architettura di rete è di tipo **Client-Server** con comunicazione su socket TCP (dominio `PF_INET`, stile `SOCK_STREAM`).
 
 ### Il Server
-Il server gestisce molteplici connessioni in modo concorrente senza bloccare l'esecuzione.
-* **Multithreading:** È stato utilizzato il modello a thread (libreria `pthread`). Il *Main Thread* esegue un loop sulla `accept()`. Per ogni nuovo client, viene generato un thread `client_handler` distaccato (`pthread_detach`) dedicato alla ricezione dei comandi tramite `read()`.
-* **Asincronicità del Broadcast:** Per soddisfare il requisito di invio periodico della mappa globale senza bloccare la ricezione dei comandi, è stato implementato un thread demone (`broadcast_thread`). Questo thread si risveglia ogni $T$ secondi (`sleep()`), calcola lo stato del gioco, verifica il timeout e invia la `GMAP` a tutti i socket attivi.
-* **Sincronizzazione:** La mappa globale (`global_map`), l'array degli utenti (`players`) e la matrice delle proprietà (`cell_owners`) sono risorse condivise. L'accesso a queste strutture è regolato da un Mutex POSIX (`pthread_mutex_t game_mutex`) per evitare *race conditions* (es. due giocatori che conquistano la stessa cella nel medesimo istante).
-* **Fog of War:** Il server mantiene la "Source of Truth" della mappa. Ogni volta che il server riceve un comando `MOV`, verifica se la destinazione è un muro. In caso positivo, il muro viene aggiunto alla matrice privata `known_walls` del giocatore, senza rivelarlo agli altri.
+Il server gestisce molteplici connessioni in modo concorrente e senza limiti a priori sul numero di utenti:
+* **Multithreading e Concorrenza:** Modello a thread (libreria POSIX `pthread`). Il thread principale accetta le connessioni tramite `accept()`, generando per ciascuna un thread `client_handler` distaccato (`pthread_detach`), garantendo il rilascio automatico delle risorse alla chiusura.
+* **Scalabilità Illimitata (Liste Concatenate):** Lo stato degli utenti non è gestito tramite array statici pre-allocati, bensì tramite una struttura dati dinamica (`PlayerNode`). Ciò consente un numero illimitato di registrazioni e permette ai giocatori disconnessi di mantenere il dominio territoriale o di riprendere la sessione in caso di riconnessione.
+* **Asincronicità del Broadcast:** Un thread demone isolato (`broadcast_thread`) si risveglia periodicamente ogni $T$ secondi per inviare gli aggiornamenti di stato globale (`GMAP`) a tutti i client attivi e monitorare il timeout globale della partita.
+* **Sincronizzazione e Sicurezza:** L'accesso alle risorse condivise (mappa e struttura dinamica dei giocatori) è protetto da un Mutex POSIX (`pthread_mutex_t game_mutex`). È stata implementata una gestione rigorosa del rilascio del lock (es. prima del `break` in caso di `QUIT`) per prevenire qualsiasi situazione di *deadlock*.
+* **Fog of War:** Il server mantiene la "Source of Truth" della mappa. Ogni movimento valuta le collisioni: se la destinazione è un muro, la posizione reale non cambia ma viene aggiornata la matrice privata `known_walls` del singolo utente.
 
 ### Il Client
-Il client è anch'esso multithread per garantire reattività:
-* Un thread principale acquisisce l'input dell'utente da `stdin` (in modo non bloccante per l'interfaccia di rete) e lo invia al server tramite `write()`.
-* Un secondo thread (`receive_thread`) resta in attesa sulla `read()` del socket, pronto a stampare i messaggi asincroni (come gli aggiornamenti `GMAP` o gli esiti `ACK`/`ERR`) non appena arrivano.
+Il client adotta un design a due thread per assicurare la massima reattività:
+* Un thread principale gestisce l'acquisizione non bloccante dei comandi da tastiera (`stdin`) e l'invio al socket tramite `write()`.
+* Un secondo thread (`receive_thread`) rimane in ascolto asincrono sulla `read()` del socket per stampare in tempo reale le notifiche di gioco (`LMAP`, `GMAP`, `ACK`, `ERR`).
 
 ---
 
-## 🗣️ Protocollo Applicativo
-La comunicazione avviene tramite stringhe testuali (ASCII) per garantire robustezza e facilità di debug.
+## 🗣️ Protocollo Applicativo (L7)
+La comunicazione avviene tramite stringhe testuali in chiaro (Human-Readable) delimitate da caratteri di newline (`\n`).
 
 ### Messaggi `Client -> Server`
-* `REG:<nickname>:<password>` : Registrazione e ingresso in mappa (credenziali limitate a 31 caratteri).
-* `MOV:<direzione>` : Spostamento del giocatore. Direzioni valide: `U` (Su), `D` (Giù), `L` (Sinistra), `R` (Destra).
-* `LIST` : Richiede la lista degli utenti attualmente connessi.
-* `QUIT` : Disconnessione e chiusura del socket.
+* `REG:<nickname>:<password>\n` : Registrazione o autenticazione dell'utente.
+* `MOV:<direzione>\n` : Spostamento del giocatore (`U` = Su, `D` = Giù, `L` = Sinistra, `R` = Destra).
+* `LIST\n` : Richiede l'elenco degli utenti correntemente online.
+* `QUIT\n` : Segnala la disconnessione volontaria e chiude il socket.
 
 ### Messaggi `Server -> Client`
-* `ACK:<messaggio>` : Conferma di un'azione (es. *Mosso e conquistato!*, *Ostacolo scoperto!*).
-* `ERR:<messaggio>` : Errore o azione non valida (es. *Fuori mappa!*, *Server pieno*).
-* `LMAP:<griglia>` : Inviata in risposta a un comando `MOV`. Contiene la visione locale del giocatore (`P` = Player, `#` = Muro noto, `X` = Propria cella, `O` = Cella nemica, `.` = Libero/Ignoto).
-* `GMAP:<dati>` : Broadcast asincrono inviato periodicamente a tutti i client, contenente le posizioni attuali in chiaro e la mappa globale delle proprietà.
-* `END:<messaggio>` : Inviato a fine partita (allo scadere del timer). Contiene l'esito della partita (vincitore) e impone la chiusura della connessione.
+* `ACK:<messaggio>\n` : Conferma di esecuzione positiva.
+* `ERR:<messaggio>\n` : Notifica di errore o azione non valida.
+* `LMAP:\n<mappa>\n` : Mappa locale inviata in unicast dopo ogni mossa (`P` = Player, `#` = Muro noto, `X` = Propria cella, `O` = Cella nemica, `.` = Libero).
+* `GMAP:\n<dati>\n` : Aggiornamento periodico in broadcast contenente posizioni e mappa globale delle proprietà.
+* `END:<messaggio>\n` : Termine della partita per scadenza del timeout, seguito dalla chiusura delle connessioni.
 
 ---
 
 ## 🚀 Guida all'Uso ed Esecuzione
 
-### Requisiti
-* Ambiente UNIX/Linux
-* Compilatore `gcc` e `make`
-* (Opzionale ma consigliato) `docker` e `docker-compose`
-
-### Metodo 1: Compilazione ed Esecuzione Standard
-1. Compilare i sorgenti tramite il `Makefile` incluso:
+### Metodo 1: Compilazione ed Esecuzione Nativa (Senza Docker)
+1. Compilare i sorgenti con il compilatore GCC:
    ```bash
-   make
+   gcc -o server server.c -lpthread
+   gcc -o client client.c -lpthread
    ```
-2. Avviare il Server (indicando la porta, es. 8080). *Nota: Il server non produrrà output a schermo, come da specifiche.*
+2. Avviare il Server specificando la porta (il server non produce alcun output su standard output come da specifiche):
    ```bash
    ./server 8080
    ```
-3. Su altri terminali (o macchine fisiche diverse), avviare uno o più Client:
+3. Da un altro terminale, avviare il Client:
    ```bash
    ./client 127.0.0.1 8080
    ```
 
-### Metodo 2: Esecuzione del Server tramite Docker 🐳
-Per isolare l'ambiente di esecuzione del server e garantire la riproducibilità, è possibile utilizzare Docker.
-1. Creare e avviare il container del server in background:
+### Metodo 2: Esecuzione tramite Docker Compose 🐳
+Il progetto include una configurazione completa per l'orchestrazione tramite container.
+1. Avviare i servizi in background (il server verrà compilato ed eseguito automaticamente in un container Ubuntu isolato):
    ```bash
-   docker-compose up -d --build
+   docker-compose up -d server client
    ```
-2. Avviare i client nativamente (o da altri container) puntando all'indirizzo del container:
+2. Aprire una sessione interattiva sul container client per giocare:
    ```bash
-   make client
-   ./client 127.0.0.1 8080
+   docker-compose exec client ./client server 8080
    ```
-3. Per fermare il server e rimuovere il container:
+3. Per terminare l'infrastruttura:
    ```bash
    docker-compose down
    ```
-
-### Gameplay Rapido
-Una volta avviato il client, digita:
-1. `REG:MioNome:MiaPass` per registrarti.
-2. `MOV:R` per muoverti a destra (o `U`, `D`, `L`).
-3. `LIST` per vedere chi sta giocando con te.
 
 ---
 

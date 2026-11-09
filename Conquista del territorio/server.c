@@ -10,11 +10,11 @@
 #include <time.h>
 
 #define MAP_SIZE 10
-#define MAX_CLIENTS 50
 #define UPDATE_INTERVAL 5
 #define GAME_DURATION 120
 
-typedef struct {
+// Struttura a lista concatenata per numero illimitato di client
+typedef struct PlayerNode {
     int fd;
     char nick[32];
     char pass[32];
@@ -22,20 +22,21 @@ typedef struct {
     int x, y;
     int score;
     char known_walls[MAP_SIZE][MAP_SIZE];
-} Player;
+    struct PlayerNode *next;
+} PlayerNode;
 
 char global_map[MAP_SIZE][MAP_SIZE];
-int cell_owners[MAP_SIZE][MAP_SIZE]; // Indice del player proprietario, -1 se nessuno
-Player players[MAX_CLIENTS];
+PlayerNode* cell_owners[MAP_SIZE][MAP_SIZE]; // Puntatore al proprietario della cella
+PlayerNode* players_head = NULL;
+
 pthread_mutex_t game_mutex = PTHREAD_MUTEX_INITIALIZER;
 int game_active = 1;
 
 void init_game() {
     srand(time(NULL));
-    for (int i = 0; i < MAX_CLIENTS; i++) players[i].fd = -1;
     for (int i = 0; i < MAP_SIZE; i++) {
         for (int j = 0; j < MAP_SIZE; j++) {
-            cell_owners[i][j] = -1;
+            cell_owners[i][j] = NULL;
             // 20% di probabilità di muro
             global_map[i][j] = (rand() % 100 < 20) ? '#' : '.'; 
         }
@@ -46,20 +47,20 @@ void send_msg(int fd, const char *msg) {
     write(fd, msg, strlen(msg));
 }
 
-void send_local_map(int player_idx) {
+void send_local_map(PlayerNode* p) {
     char buf[1024] = "LMAP:\n";
     char line[64];
     for (int i = 0; i < MAP_SIZE; i++) {
         for (int j = 0; j < MAP_SIZE; j++) {
-            if (i == players[player_idx].x && j == players[player_idx].y) strcat(buf, "P ");
-            else if (players[player_idx].known_walls[i][j] == '#') strcat(buf, "# ");
-            else if (cell_owners[i][j] == player_idx) strcat(buf, "X ");
-            else if (cell_owners[i][j] != -1) strcat(buf, "O ");
+            if (i == p->x && j == p->y) strcat(buf, "P ");
+            else if (p->known_walls[i][j] == '#') strcat(buf, "# ");
+            else if (cell_owners[i][j] == p) strcat(buf, "X ");
+            else if (cell_owners[i][j] != NULL) strcat(buf, "O ");
             else strcat(buf, ". ");
         }
         strcat(buf, "\n");
     }
-    send_msg(players[player_idx].fd, buf);
+    send_msg(p->fd, buf);
 }
 
 void *broadcast_thread(void *arg) {
@@ -67,22 +68,30 @@ void *broadcast_thread(void *arg) {
     while (game_active) {
         sleep(UPDATE_INTERVAL);
         pthread_mutex_lock(&game_mutex);
+        
         if (time(NULL) - start_time > GAME_DURATION) {
             game_active = 0;
             // Calcola vincitore
-            int max_score = -1, winner_idx = -1;
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (players[i].fd != -1 && players[i].score > max_score) {
-                    max_score = players[i].score;
-                    winner_idx = i;
+            int max_score = -1;
+            PlayerNode* winner = NULL;
+            PlayerNode* curr = players_head;
+            
+            while (curr) {
+                if (curr->score > max_score) {
+                    max_score = curr->score;
+                    winner = curr;
                 }
+                curr = curr->next;
             }
+            
             char buf[128];
-            if (winner_idx != -1) sprintf(buf, "END:Vincitore %s con %d celle!\n", players[winner_idx].nick, max_score);
+            if (winner) sprintf(buf, "END:Vincitore %s con %d celle!\n", winner->nick, max_score);
             else strcpy(buf, "END:Nessun vincitore.\n");
             
-            for (int i = 0; i < MAX_CLIENTS; i++) {
-                if (players[i].fd != -1) send_msg(players[i].fd, buf);
+            curr = players_head;
+            while (curr) {
+                if (curr->logged_in) send_msg(curr->fd, buf);
+                curr = curr->next;
             }
             pthread_mutex_unlock(&game_mutex);
             exit(0);
@@ -90,17 +99,20 @@ void *broadcast_thread(void *arg) {
 
         char buf[2048] = "GMAP:\nPosizioni: ";
         char temp[64];
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (players[i].fd != -1 && players[i].logged_in) {
-                sprintf(temp, "[%s: %d,%d] ", players[i].nick, players[i].x, players[i].y);
+        PlayerNode* curr = players_head;
+        while (curr) {
+            if (curr->logged_in) {
+                sprintf(temp, "[%s: %d,%d] ", curr->nick, curr->x, curr->y);
                 strcat(buf, temp);
             }
+            curr = curr->next;
         }
+        
         strcat(buf, "\nMappa Globale Proprieta':\n");
         for (int i = 0; i < MAP_SIZE; i++) {
             for (int j = 0; j < MAP_SIZE; j++) {
-                if (cell_owners[i][j] != -1) {
-                    sprintf(temp, "%d ", cell_owners[i][j]);
+                if (cell_owners[i][j] != NULL) {
+                    sprintf(temp, "[%c] ", cell_owners[i][j]->nick[0]);
                     strcat(buf, temp);
                 } else {
                     strcat(buf, ". ");
@@ -109,17 +121,19 @@ void *broadcast_thread(void *arg) {
             strcat(buf, "\n");
         }
         
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (players[i].fd != -1 && players[i].logged_in) send_msg(players[i].fd, buf);
+        curr = players_head;
+        while (curr) {
+            if (curr->logged_in) send_msg(curr->fd, buf);
+            curr = curr->next;
         }
         pthread_mutex_unlock(&game_mutex);
     }
     return NULL;
 }
 
-void process_move(int p_idx, char dir) {
-    int nx = players[p_idx].x;
-    int ny = players[p_idx].y;
+void process_move(PlayerNode* p, char dir) {
+    int nx = p->x;
+    int ny = p->y;
     if (dir == 'U') nx--;
     else if (dir == 'D') nx++;
     else if (dir == 'L') ny--;
@@ -127,68 +141,102 @@ void process_move(int p_idx, char dir) {
 
     if (nx >= 0 && nx < MAP_SIZE && ny >= 0 && ny < MAP_SIZE) {
         if (global_map[nx][ny] == '#') {
-            players[p_idx].known_walls[nx][ny] = '#';
-            send_msg(players[p_idx].fd, "ACK:Ostacolo scoperto!\n");
+            p->known_walls[nx][ny] = '#';
+            send_msg(p->fd, "ACK:Ostacolo scoperto!\n");
         } else {
-            players[p_idx].x = nx;
-            players[p_idx].y = ny;
-            if (cell_owners[nx][ny] != p_idx) {
-                if (cell_owners[nx][ny] != -1) players[cell_owners[nx][ny]].score--;
-                cell_owners[nx][ny] = p_idx;
-                players[p_idx].score++;
+            p->x = nx;
+            p->y = ny;
+            if (cell_owners[nx][ny] != p) {
+                if (cell_owners[nx][ny] != NULL) cell_owners[nx][ny]->score--; // Rimuove punto al vecchio proprietario
+                cell_owners[nx][ny] = p; // Ribalta la conquista
+                p->score++;
             }
-            send_msg(players[p_idx].fd, "ACK:Mosso e conquistato!\n");
+            send_msg(p->fd, "ACK:Mosso e conquistato!\n");
         }
     } else {
-        send_msg(players[p_idx].fd, "ERR:Fuori mappa!\n");
+        send_msg(p->fd, "ERR:Fuori mappa!\n");
     }
-    send_local_map(p_idx);
+    send_local_map(p);
+}
+
+PlayerNode* find_or_create_player(const char* nick, const char* pass, int fd) {
+    PlayerNode* curr = players_head;
+    while (curr) {
+        if (strcmp(curr->nick, nick) == 0 && strcmp(curr->pass, pass) == 0) {
+            curr->fd = fd;
+            curr->logged_in = 1;
+            return curr; // Riconnessione
+        }
+        curr = curr->next;
+    }
+    
+    // Nuovo utente
+    PlayerNode* new_node = malloc(sizeof(PlayerNode));
+    new_node->fd = fd;
+    strcpy(new_node->nick, nick);
+    strcpy(new_node->pass, pass);
+    new_node->logged_in = 1;
+    new_node->score = 0;
+    memset(new_node->known_walls, '.', sizeof(new_node->known_walls));
+    
+    do {
+        new_node->x = rand() % MAP_SIZE;
+        new_node->y = rand() % MAP_SIZE;
+    } while(global_map[new_node->x][new_node->y] == '#');
+
+    new_node->next = players_head;
+    players_head = new_node;
+    return new_node;
 }
 
 void *client_handler(void *arg) {
-    int p_idx = *(int*)arg;
+    int fd = *(int*)arg;
     free(arg);
     char buf[256];
-    int fd = players[p_idx].fd;
+    PlayerNode* me = NULL;
 
     while (game_active) {
-        int n = read(fd, buf, sizeof(buf)-1);
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
         if (n <= 0) break;
         buf[n] = '\0';
 
         pthread_mutex_lock(&game_mutex);
         if (strncmp(buf, "REG:", 4) == 0) {
-            sscanf(buf+4, "%31[^:]:%31s", players[p_idx].nick, players[p_idx].pass);
-            players[p_idx].logged_in = 1;
-            do {
-                players[p_idx].x = rand() % MAP_SIZE;
-                players[p_idx].y = rand() % MAP_SIZE;
-            } while(global_map[players[p_idx].x][players[p_idx].y] == '#');
-            memset(players[p_idx].known_walls, '.', sizeof(players[p_idx].known_walls));
-            send_msg(fd, "ACK:Login completato.\n");
-            send_local_map(p_idx);
+            char t_nick[32], t_pass[32];
+            if (sscanf(buf+4, "%31[^:]:%31s", t_nick, t_pass) == 2) {
+                me = find_or_create_player(t_nick, t_pass, fd);
+                send_msg(fd, "ACK:Login completato.\n");
+                send_local_map(me);
+            }
         }
-        else if (players[p_idx].logged_in) {
-            if (strncmp(buf, "MOV:", 4) == 0) process_move(p_idx, buf[4]);
+        else if (me && me->logged_in) {
+            if (strncmp(buf, "MOV:", 4) == 0) process_move(me, buf[4]);
             else if (strncmp(buf, "LIST", 4) == 0) {
                 char out[512] = "ACK:Utenti online: ";
-                for (int i=0; i<MAX_CLIENTS; i++) 
-                    if (players[i].fd != -1 && players[i].logged_in) {
-                        strcat(out, players[i].nick); strcat(out, " ");
+                PlayerNode* curr = players_head;
+                while (curr) {
+                    if (curr->logged_in) {
+                        strcat(out, curr->nick); strcat(out, " ");
                     }
+                    curr = curr->next;
+                }
                 strcat(out, "\n");
                 send_msg(fd, out);
             }
-            else if (strncmp(buf, "QUIT", 4) == 0) break;
+            else if (strncmp(buf, "QUIT", 4) == 0) {
+                pthread_mutex_unlock(&game_mutex);
+                break; // Uscita sicura dal loop
+            }
         } else {
             send_msg(fd, "ERR:Devi prima registrarti (REG:nick:pass)\n");
         }
         pthread_mutex_unlock(&game_mutex);
     }
 
+    // Disconnessione
     pthread_mutex_lock(&game_mutex);
-    close(players[p_idx].fd);
-    players[p_idx].fd = -1;
+    if (me) me->logged_in = 0; // Mantiene dominio ma risulta offline
+    close(fd);
     pthread_mutex_unlock(&game_mutex);
     return NULL;
 }
@@ -217,31 +265,19 @@ int main(int argc, char *argv[]) {
     pthread_create(&b_thread, NULL, broadcast_thread, NULL);
     pthread_detach(b_thread);
 
+    printf("Server avviato sulla porta %s. In attesa di connessioni...\n", argv[1]);
+
     while (game_active) {
         struct sockaddr_in cli_addr;
         socklen_t cli_len = sizeof(cli_addr);
         int client_fd = accept(server_fd, (struct sockaddr*)&cli_addr, &cli_len);
         if (client_fd < 0) continue;
 
-        pthread_mutex_lock(&game_mutex);
-        int free_idx = -1;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (players[i].fd == -1) { free_idx = i; break; }
-        }
-        if (free_idx != -1) {
-            players[free_idx].fd = client_fd;
-            players[free_idx].logged_in = 0;
-            players[free_idx].score = 0;
-            int *arg = malloc(sizeof(int));
-            *arg = free_idx;
-            pthread_t c_thread;
-            pthread_create(&c_thread, NULL, client_handler, arg);
-            pthread_detach(c_thread);
-        } else {
-            write(client_fd, "ERR:Server pieno\n", 17);
-            close(client_fd);
-        }
-        pthread_mutex_unlock(&game_mutex);
+        int *arg = malloc(sizeof(int));
+        *arg = client_fd;
+        pthread_t c_thread;
+        pthread_create(&c_thread, NULL, client_handler, arg);
+        pthread_detach(c_thread);
     }
     return 0;
 }

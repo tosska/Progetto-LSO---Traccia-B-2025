@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  server:
+    build: .
+    command: ./server 8080
+    ports:
+      - "8080:8080"
+    networks:
+      - lso_network
+
+  client:
+    build: .
+    # Il container client resta in ascolto per permetterti di entrarci
+    command: tail -f /dev/null
+    networks:
+      - lso_network
+
+networks:
+  lso_network:
+    driver: bridge

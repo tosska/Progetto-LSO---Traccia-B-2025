@@ -14,7 +14,7 @@ int client_active = 1;
 void *receive_thread(void *arg) {
     char buf[2048];
     while (client_active) {
-        int n = read(sock_fd, buf, sizeof(buf)-1);
+        ssize_t n = read(sock_fd, buf, sizeof(buf)-1);
         if (n <= 0) {
             printf("\nDisconnesso dal server.\n");
             client_active = 0;
@@ -54,18 +54,24 @@ int main(int argc, char *argv[]) {
     pthread_t r_thread;
     pthread_create(&r_thread, NULL, receive_thread, NULL);
 
-    printf("Comandi: REG:nick:pass | MOV:U/D/L/R | LIST | QUIT\n");
+    printf("Connessione stabilita!\nComandi: REG:nick:pass | MOV:U/D/L/R | LIST | QUIT\n");
     char input[256];
+    
     while (client_active) {
         printf("> ");
         if (fgets(input, sizeof(input), stdin) == NULL) break;
-        input[strcspn(input, "\n")] = 0;
         
-        write(sock_fd, input, strlen(input));
-        if (strncmp(input, "QUIT", 4) == 0) break;
-        sleep(1); // Breve pausa per sincronizzare l'output a schermo
+        // Rimuove l'accapo dalla stringa letta da tastiera
+        input[strcspn(input, "\n")] = 0; 
+        
+        if (strlen(input) > 0) {
+            write(sock_fd, input, strlen(input));
+            if (strncmp(input, "QUIT", 4) == 0) break;
+            sleep(1); // Pausa per sincronizzare l'interfaccia 
+        }
     }
 
+    client_active = 0;
     close(sock_fd);
     return 0;
 }

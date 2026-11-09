@@ -1,0 +1,15 @@
+# Immagine Base ufficiale di Ubuntu
+FROM ubuntu:latest
+
+# Installa il compilatore GCC e Make
+RUN apt-get update && apt-get install -y build-essential gcc
+
+# Imposta la cartella di lavoro
+WORKDIR /app
+
+# Copia i sorgenti nel container
+COPY server.c client.c ./
+
+# Compila gli eseguibili
+RUN gcc -o server server.c -lpthread
+RUN gcc -o client client.c -lpthread
